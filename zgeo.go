@@ -153,7 +153,7 @@ type Dashboard struct {
     FailureCount     int64
     AnomaliesCount   int64
     StartTime        time.Time
-    CountriesBlocked map[string]int
+    DifferentCountries map[string]int
     Baseline         ProxyInfo
     mu               sync.Mutex
 }
@@ -171,7 +171,7 @@ type Result struct {
     Baseline         ProxyInfo
     Proxies          []ProxyInfo
     BlockingLevel    int
-    BlockedCountries map[string][]string
+    DifferentCountries map[string][]ProxyInfo
 }
 
 type UsedProxyTracker struct {
@@ -276,7 +276,7 @@ var htmlTemplate = `
         <p>Total URLs analyzed: {{len .Results}}</p>
         <p>URLs with blocking detected: {{.BlockedURLs}}</p>
         <p>Total proxies tested: {{.TotalProxies}}</p>
-        <p>Total blocked proxies: {{.BlockedProxies}}</p>
+        <p>Total Different Behavior proxies: {{.BlockedProxies}}</p>
     </div>
     {{range .Results}}
     <div class="result-container">
@@ -285,7 +285,7 @@ var htmlTemplate = `
         <p><strong>Total Proxies Tested:</strong> {{len .Proxies}}</p>
         <p><strong>Successful Accesses:</strong> {{countSuccess .Proxies}}</p>
         
-        <h3>Countries with Different Behavior</h3>
+        <h3>Countries with Different Behavior ({{len .DifferentCountries}} detected)</h3>{{range $country, $proxies := .DifferentCountries}}
         <table class="sortable">
             <thead>
                 <tr>
@@ -294,7 +294,7 @@ var htmlTemplate = `
                 </tr>
             </thead>
             <tbody>
-                {{range $country, $proxies := .BlockedCountries}}
+                {{range $country, $proxies := .DifferentCountries}}
                     <tr>
                         <td>{{$country}}</td>
                         <td>{{len $proxies}}</td>
@@ -552,7 +552,7 @@ func saveHTMLReport(allResults AllResults) {
             data.BlockedURLs++
         }
         data.TotalProxies += len(result.Proxies)
-        for _, proxies := range result.BlockedCountries {
+        for _, proxies := range result.DifferentCountries {
             data.BlockedProxies += len(proxies)
         }
     }
@@ -621,15 +621,67 @@ func getBaseline(url string) (ProxyInfo, string, string) {
 }
 
 func printProxyInfo(info ProxyInfo) {
-    fmt.Printf("%-21s %-6s %-7s %-10d %-15.2f %-15.2f %-30s\n",
-        fmt.Sprintf("%s (%s)", info.Address, info.Protocol),
+    statusColor := "\033[32m" // Green
+    if info.Status != "UP" {
+        statusColor = "\033[31m" // Red
+    }
+    
+    fmt.Printf(
+        "%-25s "+statusColor+"%-7s\033[0m %-7s %-6d %-8s %-15.2f %-15.2f %s\n",
+        info.Address,
         info.Status,
         info.Country,
         info.StatusCode,
+        info.Protocol,
         info.ContentSim,
         info.TitleSim,
-        truncateString(info.Title, 30))
+        truncateString(info.Title, 40),
+    )
 }
+
+func printResults(result Result, upOnly bool) {
+
+    fmt.Printf("\n\n📊 Summary for %s\n", result.URL)
+    fmt.Printf("├─ Behavior Confidence: Level %d\n", result.BlockingLevel)
+    fmt.Printf("├─ Proxies Analyzed:    %d\n", len(result.Proxies))
+    fmt.Printf("├─ Successful Accesses: %d\n", countSuccess(result.Proxies))
+    fmt.Printf("└─ Baseline Status:     %d\n\n", result.Baseline.StatusCode)
+
+    if len(result.DifferentCountries) > 0 {
+        fmt.Println("🔍 Regional Behavior Differences:")
+        fmt.Println("+-----------------+------------------+---------+")
+        fmt.Println("| Country         | Different Proxies | Avg Sim |")
+        fmt.Println("+-----------------+------------------+---------+")
+        
+        for country, proxies := range result.DifferentCountries {
+            avgSim := 0.0
+            for _, proxy := range proxies {
+                avgSim += (proxy.ContentSim + proxy.TitleSim) / 2
+            }
+            if len(proxies) > 0 {
+                avgSim /= float64(len(proxies))
+            }
+            fmt.Printf("| %-15s | %-16d | %7.2f |\n", 
+                country, len(proxies), avgSim)
+        }
+        fmt.Println("+-----------------+------------------+---------+")
+    }
+
+    fmt.Println("\n🚩 Detailed Proxy Findings:")
+    fmt.Println(strings.Repeat("─", 100))
+    fmt.Printf("%-25s %-7s %-7s %-6s %-8s %-15s %-15s %s\n",
+        "Proxy", "Status", "Country", "Code", "Proto", "Content Sim", "Title Sim", "Title")
+    fmt.Println(strings.Repeat("─", 100))
+    
+    for _, proxy := range result.Proxies {
+        if proxy.StatusCode != 0 && (proxy.StatusCode != result.Baseline.StatusCode || 
+           proxy.ContentSim < 0.8 || proxy.TitleSim < 0.8) {
+            printProxyInfo(proxy)
+        }
+    }
+    fmt.Println(strings.Repeat("─", 100))
+}
+
 
 func runCheck(ctx context.Context, config Config) Result {
     result := Result{URL: config.TargetURL}
@@ -637,17 +689,16 @@ func runCheck(ctx context.Context, config Config) Result {
         proxies: make(map[string]struct{}),
     }
 
-        totalProxies := 0
+    totalProxies := 0
     for _, proxies := range config.ProxyList {
         totalProxies += len(proxies)
     }
-    
-        var processed uint64
-    var success, failure, errors uint64
+
     progressCtx, cancelProgress := context.WithCancel(ctx)
     defer cancelProgress()
-    
-        if !config.Verbose && totalProxies > 0 {
+
+    // Remove local progress variables and use package-level atomics directly
+    if !config.Verbose && totalProxies > 0 {
         go func() {
             ticker := time.NewTicker(500 * time.Millisecond)
             defer ticker.Stop()
@@ -655,18 +706,21 @@ func runCheck(ctx context.Context, config Config) Result {
             for {
                 select {
                 case <-ticker.C:
-                    p := atomic.LoadUint64(&processed)
-                    s := atomic.LoadUint64(&success)
-                    f := atomic.LoadUint64(&failure)
-                    e := atomic.LoadUint64(&errors)
+                    // Use package-level atomic variables directly
+                    p := atomic.LoadUint64(&processedProxies)
+                    s := atomic.LoadUint64(&successCount)
+                    f := atomic.LoadUint64(&failureCount)
+                    e := atomic.LoadUint64(&errorCount)
                     
-                                        width := 20
+                    width := 20
                     progress := float64(p)/float64(totalProxies)
                     bars := int(progress * float64(width))
                     
-                    fmt.Printf("\r[%s] %d/%d ↑%d ↓%d !%d",
-                        strings.Repeat("=", bars) + strings.Repeat(" ", width-bars),
-                        p, totalProxies, s, f, e)
+                    fmt.Printf("\r[%s%s] %d/%d | ↑%d ↓%d !%d (%.1f%%)",
+                        strings.Repeat("█", bars),
+                        strings.Repeat("░", width-bars),
+                        p, totalProxies, s, f, e,
+                        float64(p)/float64(totalProxies)*100)
                         
                 case <-progressCtx.Done():
                     fmt.Println()                     
@@ -745,7 +799,7 @@ func runCheck(ctx context.Context, config Config) Result {
     }
 
         result.BlockingLevel = determineBlockingLevel(result.Baseline, result.Proxies)
-    result.BlockedCountries = analyzeResults(result.Baseline, result.Proxies)
+    result.DifferentCountries = analyzeResults(result.Baseline, result.Proxies)
     
     return result
 }
@@ -891,88 +945,148 @@ func getCountryWithCache(ip string) (string, error) {
 
 
 func checkProxy(proxyAddr string, targetURL string, config Config) ProxyInfo {
-        if _, exists := badProxies.Load(proxyAddr); exists {
+    if _, exists := badProxies.Load(proxyAddr); exists {
         return ProxyInfo{Status: "CACHED_FAIL"}
     }
 
     info := ProxyInfo{Address: proxyAddr}
     start := time.Now()
-    
+
     defer func() {
-        if info.Status != "UP" {
+        // Only mark as bad if not UP and not a redirect case
+        if !strings.Contains(info.Status, "UP") {
             badProxies.Store(proxyAddr, true)
         }
-        logProxyAttempt(proxyAddr, start, info.Status == "UP")
+        logProxyAttempt(proxyAddr, start, strings.Contains(info.Status, "UP"))
     }()
 
-        cleanAddr := strings.TrimPrefix(strings.TrimPrefix(proxyAddr, "http://"), "https://")
+    // Validate proxy format
+    cleanAddr := strings.TrimPrefix(strings.TrimPrefix(proxyAddr, "http://"), "https://")
     host, port, err := net.SplitHostPort(cleanAddr)
     if err != nil {
         info.Status = "INVALID"
         return info
     }
 
-        ip, err := cachedLookup(host)
+    // DNS resolution with caching
+    ip, err := cachedLookup(host)
     if err != nil {
         info.Status = "DNS_FAIL"
         return info
     }
 
-        country, err := getCountryWithCache(ip)
+    // GeoIP lookup with caching
+    country, err := getCountryWithCache(ip)
     if err != nil {
         info.Country = "Unknown"
     } else {
         info.Country = country
     }
 
-        info.Protocol = determineProxyProtocol(net.JoinHostPort(ip, port))
+    // Protocol detection
+    info.Protocol = determineProxyProtocol(net.JoinHostPort(ip, port))
     if info.Protocol == "unknown" {
         info.Status = "PROTO_FAIL"
         return info
     }
 
-        client := clientPool.Get().(*fasthttp.Client)
+    // Setup HTTP client with proxy
+    client := clientPool.Get().(*fasthttp.Client)
     defer clientPool.Put(client)
-    
-        client.Dial = fasthttpproxy.FasthttpHTTPDialerTimeout(
-        cleanAddr, 
-        3*time.Second,
-    )
+    client.Dial = fasthttpproxy.FasthttpHTTPDialerTimeout(cleanAddr, 3*time.Second)
 
-    req := fasthttp.AcquireRequest()
-    defer fasthttp.ReleaseRequest(req)
-    req.SetRequestURI(targetURL)
+    maxRedirects := 3
+    redirectCount := 0
+    currentURL := targetURL
+    var firstLocation string
+    var finalStatusCode int
 
-    resp := fasthttp.AcquireResponse()
-    defer fasthttp.ReleaseResponse(resp)
+    // Redirect handling loop
+    for {
+        req := fasthttp.AcquireRequest()
+        resp := fasthttp.AcquireResponse()
+        req.SetRequestURI(currentURL)
 
-        err = client.Do(req, resp)
-    if err != nil || resp.StatusCode() >= 400 {
-        info.Status = "DOWN"
-        info.StatusCode = 0
-        return info
+        err := client.Do(req, resp)
+        finalStatusCode = resp.StatusCode()
+
+        if err != nil {
+            info.Status = "DOWN"
+            info.StatusCode = 0
+            fasthttp.ReleaseRequest(req)
+            fasthttp.ReleaseResponse(resp)
+            break
+        }
+
+        // Handle redirects
+        if redirectCount < maxRedirects && finalStatusCode >= 300 && finalStatusCode < 400 {
+            location := resp.Header.Peek("Location")
+            if len(location) > 0 {
+                if firstLocation == "" {
+                    firstLocation = string(location)
+                }
+                currentURL = string(location)
+                redirectCount++
+                fasthttp.ReleaseRequest(req)
+                fasthttp.ReleaseResponse(resp)
+                continue
+            }
+        }
+
+        // Process final response
+        info.StatusCode = finalStatusCode
+        info.Location = firstLocation  // Store first redirect location
+        
+        if finalStatusCode >= 200 && finalStatusCode < 400 {
+            if redirectCount > 0 {
+                info.Status = fmt.Sprintf("UP (%d redirects)", redirectCount)
+            } else {
+                info.Status = "UP"
+            }
+            
+            // Content analysis
+            body := resp.Body()
+            proxyContent := string(body)
+            
+            // Only compare content if baseline exists
+            if baselineContent != "" {
+                proxyTagCounts := extractTagCounts(proxyContent)
+                info.ContentSim = calculateTagSimilarity(baselineTagCounts, proxyTagCounts)
+                info.Title = extractTitle(body)
+                info.TitleSim = calculateSimilarity(info.Title, baselineTitle)
+            }
+        } else {
+            info.Status = "DOWN"
+        }
+
+        fasthttp.ReleaseRequest(req)
+        fasthttp.ReleaseResponse(resp)
+        break
     }
 
-        info.Status = "UP"
-    info.StatusCode = resp.StatusCode()
-    
-        if resp.StatusCode() == 200 {
-        body := resp.Body()
-        proxyContent := string(body)
-        proxyTagCounts := extractTagCounts(proxyContent)
-        info.ContentSim = calculateTagSimilarity(baselineTagCounts, proxyTagCounts)
-        info.Title = extractTitle(body)
-        info.TitleSim = calculateSimilarity(info.Title, baselineTitle)
-    }
-
+    // Detailed verbose logging
     if config.Verbose {
-        verboseLogger.Printf("Checking proxy: %s", proxyAddr)
-    }
-
-    // After extracting content similarity:
-    if config.Verbose {
-        verboseLogger.Printf("Proxy: %s, ContentSim: %.2f, TitleSim: %.2f", 
-            proxyAddr, info.ContentSim, info.TitleSim)
+        logDetails := []string{
+            fmt.Sprintf("Proxy: %s", proxyAddr),
+            fmt.Sprintf("Status: %s", info.Status),
+            fmt.Sprintf("Final Code: %d", info.StatusCode),
+        }
+        
+        if redirectCount > 0 {
+            logDetails = append(logDetails,
+                fmt.Sprintf("Redirects: %d", redirectCount),
+                fmt.Sprintf("First Location: %s", firstLocation),
+            )
+        }
+        
+        if info.Status == "UP" {
+            logDetails = append(logDetails,
+                fmt.Sprintf("Content Sim: %.2f", info.ContentSim),
+                fmt.Sprintf("Title Sim: %.2f", info.TitleSim),
+            )
+        }
+        
+        verboseLogger.Println(strings.Join(logDetails, " | "))
     }
 
     return info
@@ -1036,105 +1150,93 @@ func max(a, b int) int {
     return b
 }
 
+func blockingLevelDescription(level int) string {
+    return map[int]string{
+        0: "Consistent Global Access",
+        1: "Regional Behavior Variations",
+        2: "Partial Service Restrictions",
+        3: "Widespread Access Issues",
+    }[level]
+}
+
 func determineBlockingLevel(baseline ProxyInfo, proxies []ProxyInfo) int {
     if len(proxies) == 0 {
-        return 0     }
+        return 0 // No proxies to compare
+    }
 
-    baselineAccessible := baseline.StatusCode == 200
-    matchingBehavior := 0
-    differentBehavior := 0
+    baselineAccessible := baseline.StatusCode >= 200 && baseline.StatusCode < 400
+    totalCountries := make(map[string]bool)
+    blockedCountries := make(map[string]bool)
 
     for _, proxy := range proxies {
-        if proxy.StatusCode == baseline.StatusCode &&
-            proxy.ContentSim >= 0.9 &&
-            proxy.TitleSim >= 0.9 {
-            matchingBehavior++
-        } else {
-            differentBehavior++
+        totalCountries[proxy.Country] = true
+        if proxy.StatusCode != baseline.StatusCode ||
+            proxy.ContentSim < 0.8 ||  // Lower threshold for better detection
+            proxy.TitleSim < 0.8 {
+            blockedCountries[proxy.Country] = true
         }
     }
 
     if baselineAccessible {
-        if differentBehavior > 0 {
-                        return 1
+        if len(blockedCountries) > 0 {
+            return 1 // Different behavior detected
         }
-                return 0
+        return 0 // No blocking detected
     }
 
-        accessibleProxies := 0
+    // When baseline is blocked, analyze proxy accessibility
+    successfulProxies := 0
     for _, proxy := range proxies {
-        if proxy.StatusCode == 200 {
-            accessibleProxies++
+        if proxy.StatusCode >= 200 && proxy.StatusCode < 400 {
+            successfulProxies++
         }
     }
 
-    if accessibleProxies == 0 {
-        return 3     }
+    successRatio := float64(successfulProxies) / float64(len(proxies))
+    switch {
+    case successRatio == 0:
+        return 3 // All access blocked
+    case successRatio < 0.3:
+        return 3 // Strict blocking
+    case successRatio < 0.7:
+        return 2 // Partial blocking
+    default:
+        return 1 // Minimal blocking
+    }
+}
 
-    blockingPercentage := float64(accessibleProxies) / float64(len(proxies))
-    if blockingPercentage <= 0.5 {
-        return 3     }
-    return 2 }
-
-func analyzeResults(baseline ProxyInfo, proxies []ProxyInfo) map[string][]string {
-    differentBehavior := make(map[string][]string)
-    statusCounts := make(map[int]int)
+func analyzeResults(baseline ProxyInfo, proxies []ProxyInfo) map[string][]ProxyInfo {
+    countryStats := make(map[string][]ProxyInfo)
+    totalCountries := make(map[string]bool)
     
     for _, proxy := range proxies {
-        statusCounts[proxy.StatusCode]++
-    }
-
-    for _, proxy := range proxies {
-        // Special case: baseline failed to load (e.g., local access blocked)
+        totalCountries[proxy.Country] = true
         sameBehavior := true
         
         if baseline.StatusCode >= 200 && baseline.StatusCode < 400 {
-            // Baseline is valid, normal check
             sameBehavior = proxy.StatusCode == baseline.StatusCode &&
-                proxy.ContentSim >= 0.9 &&
-                proxy.TitleSim >= 0.9
+                proxy.ContentSim >= 0.8 &&
+                proxy.TitleSim >= 0.8
         } else {
-            // Baseline is invalid, mark as different if proxy is UP with content
             sameBehavior = !(proxy.Status == "UP" && (proxy.ContentSim < 0.8 || proxy.TitleSim < 0.8))
         }
 
         if !sameBehavior {
-            differentBehavior[proxy.Country] = append(differentBehavior[proxy.Country], proxy.Address)
+            countryStats[proxy.Country] = append(countryStats[proxy.Country], 
+                proxy)
         }
     }
-    return differentBehavior
-}
 
-func printResults(result Result, upOnly bool) {
-    fmt.Printf("\n=== Final Results for %s ===\n", result.URL)
-    fmt.Printf("Blocking Level: %d\n", result.BlockingLevel)
-    
-    if len(result.BlockedCountries) > 0 {
-        fmt.Printf("Blocked Countries (%d):\n", len(result.BlockedCountries))
-        for country, proxies := range result.BlockedCountries {
-            fmt.Printf("  - %s: %d proxies\n", country, len(proxies))
+    // Add reporting for total countries tested
+    if len(countryStats) > 0 {
+        fmt.Printf("\nDifferent behavior detected in %d/%d countries:\n", 
+            len(countryStats), len(totalCountries))
+        for country := range countryStats {
+            fmt.Printf(" - %s\n", country)
         }
-    } else {
-        fmt.Println("No country-based blocking detected")
     }
     
-    fmt.Printf("\nTotal Proxies Tested: %d\n", len(result.Proxies))
-    fmt.Printf("Successful Accesses: %d\n", countSuccess(result.Proxies))
-
-    fmt.Println("\nProxies with Different Behavior:")
-    for _, proxy := range result.Proxies {
-        if proxy.StatusCode != 0 && (proxy.StatusCode != result.Baseline.StatusCode || proxy.ContentSim < 0.9 || proxy.TitleSim < 0.9) {
-            fmt.Printf("  Proxy: %s (%s) [%s]\n", proxy.Address, proxy.Country, proxy.Protocol)
-            fmt.Printf("    Status Code: %d (Baseline: %d)\n", proxy.StatusCode, result.Baseline.StatusCode)
-            fmt.Printf("    Content Similarity: %.2f\n", proxy.ContentSim)
-            fmt.Printf("    Title Similarity: %.2f\n", proxy.TitleSim)
-            fmt.Printf("    Title: %s\n", truncateString(proxy.Title, 50))
-            fmt.Printf("    Baseline Title: %s\n", truncateString(result.Baseline.Title, 50))
-            if proxy.StatusCode == 301 {
-                fmt.Printf("    Location: %s\n", proxy.Location)
-            }
-        }
-    }
+    return countryStats
 }
 
 func countSuccess(proxies []ProxyInfo) int {
@@ -1167,7 +1269,7 @@ func updateDashboardMetrics(info ProxyInfo) {
 
     if info.StatusCode != 0 && (info.StatusCode != 200 || info.ContentSim < 0.9 || info.TitleSim < 0.9) {
         dashboard.AnomaliesCount++
-        dashboard.CountriesBlocked[info.Country]++
+        dashboard.DifferentCountries[info.Country]++
     }
 }
 
@@ -1349,7 +1451,9 @@ func saveFreshProxies(proxies []ProxyInfo) {
     baselineValid := dashboard.Baseline.StatusCode >= 200 && dashboard.Baseline.StatusCode < 400 &&
                     len(baselineContent) > 0 && baselineTitle != ""
 
-    fmt.Printf("\nSaving fresh proxies... (Baseline valid: %v)\n", baselineValid)
+    if *vFlag {
+        fmt.Printf("\nSaving fresh proxies... (Baseline valid: %v)\n", baselineValid)
+    }
 
     for _, proxy := range proxies {
         if proxy.Status != "UP" {
@@ -1369,7 +1473,7 @@ func saveFreshProxies(proxies []ProxyInfo) {
             score = (proxy.ContentSim + proxy.TitleSim) / 2
             success = score >= 0.8
         } else {
-                        score = 1.0
+            score = 1.0
             success = true
         }
 
@@ -1383,8 +1487,29 @@ func saveFreshProxies(proxies []ProxyInfo) {
         })
     }
 
-        fmt.Printf("\nSaved %d/%d UP proxies to %s (Baseline valid: %v)\n",
-        len(freshProxies), totalUp, filename, baselineValid)
+    // Actually write to file
+    file, err := os.Create(filename)
+    if err != nil {
+        if *vFlag {
+            fmt.Printf("Error creating fresh proxies file: %v\n", err)
+        }
+        return
+    }
+    defer file.Close()
+
+    encoder := json.NewEncoder(file)
+    encoder.SetIndent("", "  ")
+    if err := encoder.Encode(freshProxies); err != nil {
+        if *vFlag {
+            fmt.Printf("Error encoding fresh proxies: %v\n", err)
+        }
+        return
+    }
+
+    if *vFlag {
+        fmt.Printf("Saved %d/%d UP proxies to %s (Baseline valid: %v)\n",
+            len(freshProxies), totalUp, filename, baselineValid)
+    }
 }
 
 func runMassiveCheck(ctx context.Context, config Config) []Result {
@@ -1557,7 +1682,7 @@ func main() {
     dashboard.Baseline = baselineInfo
 
         dashboard.StartTime = time.Now()
-    dashboard.CountriesBlocked = make(map[string]int)
+    dashboard.DifferentCountries = make(map[string]int)
 
     var allResults AllResults
     allResults.StartTime = dashboard.StartTime
@@ -1618,7 +1743,7 @@ func improveJSONOutput(results []Result) map[string]interface{} {
         detailedResult := make(map[string]interface{})
         detailedResult["url"] = result.URL
         detailedResult["blocking_level"] = result.BlockingLevel
-        detailedResult["blocked_countries"] = result.BlockedCountries
+        detailedResult["different_countries"] = result.DifferentCountries
         
         if result.BlockingLevel > 0 {
             output["blocked_urls"] = output["blocked_urls"].(int) + 1
@@ -1626,7 +1751,7 @@ func improveJSONOutput(results []Result) map[string]interface{} {
         
         output["total_proxies"] = output["total_proxies"].(int) + len(result.Proxies)
         
-        for country, proxies := range result.BlockedCountries {
+        for country, proxies := range result.DifferentCountries {
             countriesBlocked[country] += len(proxies)
             output["blocked_proxies"] = output["blocked_proxies"].(int) + len(proxies)
         }
@@ -1672,7 +1797,7 @@ func generateSummaryReport(results []Result) string {
             differentBehavior++
         }
         totalProxies += len(result.Proxies)
-        for _, proxies := range result.BlockedCountries {
+        for _, proxies := range result.DifferentCountries {
             totalDifferent += len(proxies)
         }
     }
