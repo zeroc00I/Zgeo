@@ -8,33 +8,29 @@ Advanced geofence penetration script for red teams and security researchers.
 - **IP2Location Geolocation Engine**: Uses memory-mapped IP2Location DB for fast IP-to-country lookups:
 
 ```go
-func getCountry(ip string) (string, error) {
-    results, err := ip2locationDB.Get_all(ip)
-    return results.Country_short, nil
-}
+geoCache.RLock()
+country := geoCache.m[ip]  // Cached lookup
+geoCache.RUnlock()
 ```
-- **Content Fingerprinting**: 
-  - Levenshtein distance analysis
-  - Structural HTML comparison
-  - Resource loading pattern detection
-- **Protocol Analysis**:
-  - HTTP/HTTPS proxy auto-detection
-  - SOCKS5 protocol validation
-- **Resiliency Engine**:
-  - Adaptive retry mechanism (configurable backoff)
-  - Connection pooling (100+ concurrent workers)
-  - Smart proxy rotation algorithms
+- **Multi-Layer Analysis**: 
+  - HTTP/SOCKS5 protocol auto-detection
+  - Structural HTML fingerprinting
+  - TLS fingerprint resistance
+- **Resiliency Core**:
+  - Adaptive backoff retries (up to 5s)
+  - Connection pooling (200+ workers)
+  - DNS caching with TTL management
 
 ## Installation
 ```bash
 # install binary
 go install github.com/zerocool/zgeo@latest
 
-# get geo database
-wget https://download.ip2location.com/lite/IP2LOCATION-LITE-DB1.BIN
+# Get latest IP database
+wget https://github.com/zeroc00I/Zgeo/raw/refs/heads/main/db-1.bin
 ```
 
-## Basic Usage
+## Operational Commands
 ```bash
 # Single URL
 zgeo -w proxies.txt -u https://blocked-site.com
@@ -52,14 +48,17 @@ zgeo -f -r 3 -o report.html
 |-w             | Proxy list file (txt)            |            |
 |-u             | Target URL                         |            |
 |-tw            | Target URLs file (1 per line)        |            |
-|-t             | Thread count                      | 5           |
+|-t             | Thread count                      | 50           |
 |-jw            | JSON proxy wordlist                |           |
 |-db            | IP2Location DB path               | IP2LOCATION... |
 |-o            | Output format (html|json)          | json       |
-|-v             | Verbose mode                      | false      |
-|-fp            | Generate fresh proxy file            | false       |
+|-v             | Verbose diagnostics                      | false      |
+|-fpo            | Generate fresh proxy file            | false       |
 |-oa            | One attempt per country          | false       |
-|-r             | Retry attempts                   | 0           |
+|-r             | Retry attempts                   | 3           |
+|-oa             | One attempt per country		                   | 5s           |
+|-timeout             | Connection timeout	                   | 5s           |
+
 
 
 #### Geolocation Workflow:
