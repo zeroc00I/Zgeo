@@ -112,8 +112,10 @@ type ActiveProxies struct {
        return 0.0
    }
    
-   similarity := 2.0 * float64(common) / float64(total)
-   return math.Max(similarity, 0.0)  }
+    similarity := 2.0 * float64(common) / float64(total)
+    similarity = math.Max(similarity, 0.0)
+    similarity = math.Round(similarity*100) / 100 // Round to two decimals
+    return math.Max(similarity, 0.0)  }
 
 
 func (ap *ActiveProxies) Add(proxy ProxyInfo) {
@@ -347,19 +349,21 @@ var htmlTemplate = `
 `
 
 func determineProxyProtocol(proxyAddr string) string {
-    conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
+    conn, err := net.DialTimeout("tcp", proxyAddr, 1*time.Second)
     if err != nil {
         return "unknown"
     }
     defer conn.Close()
 
+    // Test HTTPS support
     _, err = conn.Write([]byte("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"))
     if err != nil {
-        return "unknown"
+        return "http" // Fallback to HTTP
     }
 
+    // Read response with timeout
+    conn.SetReadDeadline(time.Now().Add(2 * time.Second))
     buffer := make([]byte, 1024)
-    conn.SetReadDeadline(time.Now().Add(5 * time.Second))
     n, err := conn.Read(buffer)
     if err != nil {
         return "http"
@@ -369,7 +373,6 @@ func determineProxyProtocol(proxyAddr string) string {
     if strings.Contains(response, "200 Connection established") {
         return "https"
     }
-
     return "http"
 }
 
@@ -693,6 +696,7 @@ func runCheck(ctx context.Context, config Config) Result {
                                         atomic.AddUint64(&processedProxies, 1)
                     if info.Status == "UP" {
                         atomic.AddUint64(&successCount, 1)
+                        activeProxies.Add(info)
                     } else {
                         atomic.AddUint64(&failureCount, 1)
                     }
@@ -961,6 +965,16 @@ func checkProxy(proxyAddr string, targetURL string, config Config) ProxyInfo {
         info.TitleSim = calculateSimilarity(info.Title, baselineTitle)
     }
 
+    if config.Verbose {
+        verboseLogger.Printf("Checking proxy: %s", proxyAddr)
+    }
+
+    // After extracting content similarity:
+    if config.Verbose {
+        verboseLogger.Printf("Proxy: %s, ContentSim: %.2f, TitleSim: %.2f", 
+            proxyAddr, info.ContentSim, info.TitleSim)
+    }
+
     return info
 }
 
@@ -1071,16 +1085,23 @@ func analyzeResults(baseline ProxyInfo, proxies []ProxyInfo) map[string][]string
     }
 
     for _, proxy := range proxies {
-        sameBehavior := proxy.StatusCode == baseline.StatusCode &&
-            proxy.ContentSim >= 0.9 &&
-            proxy.TitleSim >= 0.9
+        // Special case: baseline failed to load (e.g., local access blocked)
+        sameBehavior := true
+        
+        if baseline.StatusCode >= 200 && baseline.StatusCode < 400 {
+            // Baseline is valid, normal check
+            sameBehavior = proxy.StatusCode == baseline.StatusCode &&
+                proxy.ContentSim >= 0.9 &&
+                proxy.TitleSim >= 0.9
+        } else {
+            // Baseline is invalid, mark as different if proxy is UP with content
+            sameBehavior = !(proxy.Status == "UP" && (proxy.ContentSim < 0.8 || proxy.TitleSim < 0.8))
+        }
 
         if !sameBehavior {
-            differentBehavior[proxy.Country] = append(differentBehavior[proxy.Country], 
-                fmt.Sprintf("%s (%s)", proxy.Address, proxy.Protocol))
+            differentBehavior[proxy.Country] = append(differentBehavior[proxy.Country], proxy.Address)
         }
     }
-
     return differentBehavior
 }
 
