@@ -1,6 +1,8 @@
 package main
 
 import (
+    "crypto/tls"
+    "net/url"
     "sync/atomic"
     "golang.org/x/net/html"
     "log"
@@ -27,7 +29,7 @@ import (
 	"github.com/ip2location/ip2location-go"
 	"github.com/texttheater/golang-levenshtein/levenshtein"
 	"github.com/valyala/fasthttp"
-	"github.com/valyala/fasthttp/fasthttpproxy"
+    "path/filepath"
 )
 
 var (
@@ -45,14 +47,6 @@ var (
     baselineTitle   string
     ip2locationDB   *ip2location.DB
     ipCache         sync.Map
-    httpClient      = &http.Client{
-        Transport: &http.Transport{
-            MaxIdleConnsPerHost: 100,
-            MaxConnsPerHost:     500,
-            IdleConnTimeout:     90 * time.Second,
-        },
-        Timeout: 10 * time.Second,
-    }
     dashboard Dashboard
 )
 var (
@@ -169,6 +163,7 @@ type AllResults struct {
 type Result struct {
     URL              string
     Baseline         ProxyInfo
+    LocalCountry     string
     Proxies          []ProxyInfo
     BlockingLevel    int
     DifferentCountries map[string][]ProxyInfo
@@ -194,6 +189,7 @@ func (u *UsedProxyTracker) MarkUsed(proxy string) bool {
 }
 
 type Config struct {
+    Timeout         time.Duration
     ProxiesFile          string
     ProxyList            ProxyMap
     JSONWordlist         string
@@ -228,18 +224,6 @@ var (
 )
 
 
-var clientPool = sync.Pool{
-    New: func() interface{} {
-        return &fasthttp.Client{
-            ReadTimeout:  3 * time.Second,
-            WriteTimeout: 3 * time.Second,
-            Dial: func(addr string) (net.Conn, error) {
-                return fasthttp.DialTimeout(addr, 2*time.Second)
-            },
-        }
-    },
-}
-
 var htmlTemplate = `
 <!DOCTYPE html>
 <html lang="en">
@@ -248,6 +232,10 @@ var htmlTemplate = `
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Geo-Blocking Analysis Report</title>
     <style>
+        .comparison-table { margin-top: 20px; background: #f9f9f9; }
+        .local-response { background-color: #e6ffe6; font-weight: bold; }
+        .highlight { color: #ff4444; font-size: 0.9em; }
+        .low-sim { background-color: #ffe6e6; }
         body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 1200px; margin: 0 auto; padding: 20px; }
         h1, h2, h3 { color: #2c3e50; }
         .result-container { border: 1px solid #ddd; padding: 20px; margin-bottom: 20px; border-radius: 5px; }
@@ -278,14 +266,19 @@ var htmlTemplate = `
         <p>Total proxies tested: {{.TotalProxies}}</p>
         <p>Total Different Behavior proxies: {{.BlockedProxies}}</p>
     </div>
-    {{range .Results}}
+
+    {{range $result := .Results}}
     <div class="result-container">
-        <h2>Results for {{.URL}}</h2>
-        <p><strong>Blocking Level:</strong> {{.BlockingLevel}}</p>
-        <p><strong>Total Proxies Tested:</strong> {{len .Proxies}}</p>
-        <p><strong>Successful Accesses:</strong> {{countSuccess .Proxies}}</p>
-        
-        <h3>Countries with Different Behavior ({{len .DifferentCountries}} detected)</h3>{{range $country, $proxies := .DifferentCountries}}
+        <h2>Results for {{$result.URL}}</h2>
+        <div class="local-info">
+            <p><strong>Local Country:</strong> {{$result.LocalCountry}}</p>
+            <p><strong>Baseline Status:</strong> {{$result.Baseline.StatusCode}} ({{$result.Baseline.Country}})</p>
+            <p><strong>Blocking Level:</strong> {{$result.BlockingLevel}}</p>
+            <p><strong>Total Proxies Tested:</strong> {{len $result.Proxies}}</p>
+            <p><strong>Successful Accesses:</strong> {{countSuccess $result.Proxies}}</p>
+        </div>
+
+        <h3>Countries with Different Behavior ({{len $result.DifferentCountries}} detected)</h3>
         <table class="sortable">
             <thead>
                 <tr>
@@ -294,75 +287,148 @@ var htmlTemplate = `
                 </tr>
             </thead>
             <tbody>
-                {{range $country, $proxies := .DifferentCountries}}
-                    <tr>
-                        <td>{{$country}}</td>
-                        <td>{{len $proxies}}</td>
-                    </tr>
+                {{range $country, $proxies := $result.DifferentCountries}}
+                <tr>
+                    <td>{{$country}}</td>
+                    <td>{{len $proxies}}</td>
+                </tr>
                 {{end}}
             </tbody>
         </table>
 
-<h3>Proxies with Different Behavior</h3>
-<table class="sortable">
-    <thead>
-        <tr>
-            <th>Proxy</th>
-            <th>Country</th>
-            <th>Status Code</th>
-            <th>Content Similarity</th>
-            <th>Title Similarity</th>
-            <th>Title</th>
-        </tr>
-    </thead>
-    <tbody>
-        {{$baseline := .Baseline}}
-        {{$commonStatus := mostCommonStatus .Proxies}}
-        {{range .Proxies}}
-            {{if ne .StatusCode 0}}
-                {{if or (ne .StatusCode $baseline.StatusCode) (lt .ContentSim 0.9) (lt .TitleSim 0.9)}}
-                    <tr class="{{if and (ne .StatusCode $baseline.StatusCode) (ne .StatusCode $commonStatus)}}unique-behavior{{else}}different-behavior{{end}}">
-                        <td>{{.Address}}</td>
-                        <td>{{.Country}}</td>
-                        <td>
-                            {{.StatusCode}}
-                            {{if ne .StatusCode $baseline.StatusCode}}
-                                <span class="highlight">(Baseline: {{$baseline.StatusCode}})</span>
-                            {{end}}
-                            {{if and (ne .StatusCode $baseline.StatusCode) (ne .StatusCode $commonStatus)}}
-                                <span class="highlight">(Common: {{$commonStatus}})</span>
-                            {{end}}
-                        </td>
-                        <td>{{printf "%.2f" .ContentSim}}{{if lt .ContentSim 0.9}}<span class="highlight">*</span>{{end}}</td>
-                        <td>{{printf "%.2f" .TitleSim}}{{if lt .TitleSim 0.9}}<span class="highlight">*</span>{{end}}</td>
-                        <td>{{truncateString .Title 50}}</td>
-                    </tr>
-                    {{end}}
-            {{end}}
-        {{end}}
-    </tbody>
-</table>
+        <h3>Response Comparison: Local vs Proxies</h3>
+        <table class="comparison-table">
+            <thead>
+                <tr>
+                    <th>Type</th>
+                    <th>Country</th>
+                    <th>Status Code</th>
+                    <th>Content Similarity</th>
+                    <th>Title Similarity</th>
+                    <th>Response Title</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr class="local-response">
+                    <td>Local</td>
+                    <td>{{$result.LocalCountry}}</td>
+                    <td>{{$result.Baseline.StatusCode}} (Baseline)</td>
+                    <td>1.00</td>
+                    <td>1.00</td>
+                    <td>{{truncateString $result.Baseline.Title 50}}</td>
+                </tr>
+                
+                {{range $proxy := $result.Proxies}}
+                {{if ne $proxy.StatusCode 0}}
+                <tr class="{{if lt $proxy.ContentSim 0.9}}low-sim{{end}}">
+                    <td>Proxy</td>
+                    <td>{{$proxy.Country}}</td>
+                    <td>
+                        {{$proxy.StatusCode}}
+                        {{if ne $proxy.StatusCode $result.Baseline.StatusCode}}
+                        <span class="highlight">(Δ{{sub $proxy.StatusCode $result.Baseline.StatusCode}})</span>
+                        {{end}}
+                    </td>
+                    <td>
+                        {{printf "%.2f" $proxy.ContentSim}}
+                        {{if lt $proxy.ContentSim 0.9}}<span class="highlight">*</span>{{end}}
+                    </td>
+                    <td>
+                        {{printf "%.2f" $proxy.TitleSim}} 
+                        {{if lt $proxy.TitleSim 0.9}}<span class="highlight">*</span>{{end}}
+                    </td>
+                    <td>{{truncateString $proxy.Title 50}}</td>
+                </tr>
+                {{end}}
+                {{end}}
+            </tbody>
+        </table>
+
+        <h3>Proxies with Different Behavior</h3>
+        <table class="sortable">
+            <thead>
+                <tr>
+                    <th>Proxy</th>
+                    <th>Country</th>
+                    <th>Status Code</th>
+                    <th>Content Similarity</th>
+                    <th>Title Similarity</th>
+                    <th>Response</th>
+                </tr>
+            </thead>
+            <tbody>
+                {{$baseline := $result.Baseline}}
+                {{$commonStatus := mostCommonStatus $result.Proxies}}
+                {{range $proxy := $result.Proxies}}
+                {{if ne $proxy.StatusCode 0}}
+                {{if or (ne $proxy.StatusCode $baseline.StatusCode) (lt $proxy.ContentSim 0.9) (lt $proxy.TitleSim 0.9)}}
+                <tr class="{{if and (ne $proxy.StatusCode $baseline.StatusCode) (ne $proxy.StatusCode $commonStatus)}}unique-behavior{{else}}different-behavior{{end}}">
+                    <td>{{$proxy.Address}}</td>
+                    <td>{{$proxy.Country}}</td>
+                    <td>
+                        {{$proxy.StatusCode}}
+                        {{if ne $proxy.StatusCode $baseline.StatusCode}}
+                        <span class="highlight">(Baseline: {{$baseline.StatusCode}})</span>
+                        {{end}}
+                        {{if and (ne $proxy.StatusCode $baseline.StatusCode) (ne $proxy.StatusCode $commonStatus)}}
+                        <span class="highlight">(Common: {{$commonStatus}})</span>
+                        {{end}}
+                    </td>
+                    <td>
+                        {{printf "%.2f" $proxy.ContentSim}}
+                        {{if lt $proxy.ContentSim 0.9}}<span class="highlight">*</span>{{end}}
+                    </td>
+                    <td>
+                        {{printf "%.2f" $proxy.TitleSim}}
+                        {{if lt $proxy.TitleSim 0.9}}<span class="highlight">*</span>{{end}}
+                    </td>
+                    <td>
+                        {{if $proxy.Title}}
+                            {{truncateString $proxy.Title 50}}
+                        {{else}}
+                            {{$proxy.Status}}
+                        {{end}}
+                    </td>
+                </tr>
+                {{end}}
+                {{end}}
+                {{end}}
+            </tbody>
+        </table>
     </div>
     {{end}}
 </body>
 </html>
 `
 
-func determineProxyProtocol(proxyAddr string) string {
-    conn, err := net.DialTimeout("tcp", proxyAddr, 1*time.Second)
+
+
+func determineProxyProtocol(ctx context.Context, proxyAddr string) string {
+    dialer := &net.Dialer{
+        Timeout: 1 * time.Second,
+    }
+    
+    // Use context-aware dialing
+    conn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
     if err != nil {
         return "unknown"
     }
     defer conn.Close()
 
+    // Set overall deadline from context
+    deadline, ok := ctx.Deadline()
+    if ok {
+        conn.SetDeadline(deadline)
+    } else {
+        conn.SetDeadline(time.Now().Add(2 * time.Second))
+    }
+
     // Test HTTPS support
     _, err = conn.Write([]byte("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"))
     if err != nil {
-        return "http" // Fallback to HTTP
+        return "http"
     }
 
-    // Read response with timeout
-    conn.SetReadDeadline(time.Now().Add(2 * time.Second))
     buffer := make([]byte, 1024)
     n, err := conn.Read(buffer)
     if err != nil {
@@ -375,8 +441,10 @@ func determineProxyProtocol(proxyAddr string) string {
     }
     return "http"
 }
-
 func getCountry(ip string) (string, error) {
+    if ip2locationDB == nil {
+        return "", fmt.Errorf("IP2Location database not initialized")
+    }
     if net.ParseIP(ip) == nil {
         return "Invalid", nil
     }
@@ -417,7 +485,7 @@ func sendFileProxies(filename string, proxyChan chan<- string, oneAttemptPerCoun
             continue         }
         if oneAttemptPerCountry {
             host, _, _ := net.SplitHostPort(proxy)
-            country, err := getCountry(host)
+            country, err := getCountryWithCache(context.Background(), host)
             if err != nil {
                 fmt.Printf("Error getting country for IP %s: %v\n", host, err)
                 continue
@@ -503,16 +571,32 @@ func saveHTMLReport(allResults AllResults) {
     defer f.Close()
 
     funcMap := template.FuncMap{
-        "truncateString": truncateString,
-        "countSuccess": countSuccess,
+        "truncateString": func(s string, max int) string {
+            if len(s) <= max {
+                return s
+            }
+            return s[:max-3] + "..."
+        },
+        "countSuccess": func(proxies []ProxyInfo) int {
+            count := 0
+            for _, p := range proxies {
+                if p.Status == "UP" {
+                    count++
+                }
+            }
+            return count
+        },
         "mostCommonStatus": mostCommonStatus,
+        "sub": func(a, b int) int { return a - b },
+        "lt": func(a, b float64) bool { return a < b },
+        "percentage": func(f float64) string {
+            return fmt.Sprintf("%.0f%%", f*100)
+        },
     }
 
-    tmpl, err := template.New("report").Funcs(funcMap).Parse(htmlTemplate)
-    if err != nil {
-        fmt.Printf("Error parsing HTML template: %v\n", err)
-        return
-    }
+    tmpl := template.Must(
+        template.New("report").Funcs(funcMap).Parse(htmlTemplate),
+    )
 
     debugInfo := fmt.Sprintf("Number of results: %d\n", len(allResults.Results))
     for i, result := range allResults.Results {
@@ -522,12 +606,6 @@ func saveHTMLReport(allResults AllResults) {
         if len(result.Proxies) > 0 {
             debugInfo += fmt.Sprintf("  First proxy Address: %s\n", result.Proxies[0].Address)
             debugInfo += fmt.Sprintf("  First proxy Country: %s\n", result.Proxies[0].Country)
-        } else {
-            debugInfo += "  No proxies in this result\n"
-        }
-        debugInfo += fmt.Sprintf("  All proxies:\n")
-        for j, proxy := range result.Proxies {
-            debugInfo += fmt.Sprintf("    Proxy %d: Address: %s, Country: %s\n", j, proxy.Address, proxy.Country)
         }
     }
 
@@ -540,12 +618,14 @@ func saveHTMLReport(allResults AllResults) {
         BlockedProxies int
         DebugInfo     string
     }{
-        Results:   allResults.Results,
-        StartTime: allResults.StartTime,
-        EndTime:   allResults.EndTime,
-        DebugInfo: debugInfo,
+        Results:       allResults.Results,
+        StartTime:     allResults.StartTime,
+        EndTime:       allResults.EndTime,
+        BlockedURLs:   0,
+        TotalProxies:   0,
+        BlockedProxies: 0,
+        DebugInfo:     debugInfo,
     }
-
 
     for _, result := range data.Results {
         if result.BlockingLevel > 0 {
@@ -557,8 +637,7 @@ func saveHTMLReport(allResults AllResults) {
         }
     }
 
-    err = tmpl.Execute(f, data)
-    if err != nil {
+    if err := tmpl.Execute(f, data); err != nil {
         fmt.Printf("Error executing HTML template: %v\n", err)
         return
     }
@@ -566,8 +645,8 @@ func saveHTMLReport(allResults AllResults) {
     fmt.Printf("HTML report saved to %s\n", filename)
 }
 
-func quickProxyCheck(proxyAddr string) bool {
-    conn, err := net.DialTimeout("tcp", proxyAddr, 500*time.Millisecond)
+func quickProxyCheck(proxyAddr string, timeout time.Duration) bool {
+    conn, err := net.DialTimeout("tcp", proxyAddr, timeout)
     if err != nil {
         return false
     }
@@ -600,24 +679,47 @@ func extractTitle(body []byte) string {
 
 
 func getBaseline(url string) (ProxyInfo, string, string) {
-        resp, err := httpClient.Get(url)
+    localCountry := getLocalCountry()
+    
+    client := &http.Client{
+        Timeout: 15 * time.Second,
+        Transport: &http.Transport{
+            TLSClientConfig: &tls.Config{
+                InsecureSkipVerify: true,
+                MinVersion: tls.VersionTLS12,
+            },
+        },
+    }
+
+    req, _ := http.NewRequest("GET", url, nil)
+    req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+
+    resp, err := client.Do(req)
     if err != nil {
-        return ProxyInfo{}, "", ""
+        return ProxyInfo{
+            Status:     "CONNECTION_FAILED",
+            StatusCode: 0,
+            Country:    localCountry,
+            Protocol:   "DIRECT",
+        }, "", ""
     }
     defer resp.Body.Close()
 
-    body, err := io.ReadAll(resp.Body)
-    if err != nil {
-        return ProxyInfo{}, "", ""
-    }
-
-    info := ProxyInfo{
+    body, _ := io.ReadAll(resp.Body)
+    return ProxyInfo{
         Status:     "UP",
         StatusCode: resp.StatusCode,
+        Country:    localCountry,
+        Protocol:   "DIRECT",
+        Location:   resp.Header.Get("Location"),
+    }, string(body), extractTitle(body)
+}
+
+func statusDescription(code int) string {
+    if code == 0 {
+        return "Connection Failed"
     }
-    title := extractTitle(body)
-    baselineTagCounts = extractTagCounts(string(body))     
-    return info, string(body), title
+    return "UP"
 }
 
 func printProxyInfo(info ProxyInfo) {
@@ -640,46 +742,33 @@ func printProxyInfo(info ProxyInfo) {
 }
 
 func printResults(result Result, upOnly bool) {
-
-    fmt.Printf("\n\n📊 Summary for %s\n", result.URL)
-    fmt.Printf("├─ Behavior Confidence: Level %d\n", result.BlockingLevel)
-    fmt.Printf("├─ Proxies Analyzed:    %d\n", len(result.Proxies))
-    fmt.Printf("├─ Successful Accesses: %d\n", countSuccess(result.Proxies))
-    fmt.Printf("└─ Baseline Status:     %d\n\n", result.Baseline.StatusCode)
-
-    if len(result.DifferentCountries) > 0 {
-        fmt.Println("🔍 Regional Behavior Differences:")
-        fmt.Println("+-----------------+------------------+---------+")
-        fmt.Println("| Country         | Different Proxies | Avg Sim |")
-        fmt.Println("+-----------------+------------------+---------+")
-        
-        for country, proxies := range result.DifferentCountries {
-            avgSim := 0.0
-            for _, proxy := range proxies {
-                avgSim += (proxy.ContentSim + proxy.TitleSim) / 2
-            }
-            if len(proxies) > 0 {
-                avgSim /= float64(len(proxies))
-            }
-            fmt.Printf("| %-15s | %-16d | %7.2f |\n", 
-                country, len(proxies), avgSim)
-        }
-        fmt.Println("+-----------------+------------------+---------+")
-    }
-
-    fmt.Println("\n🚩 Detailed Proxy Findings:")
-    fmt.Println(strings.Repeat("─", 100))
-    fmt.Printf("%-25s %-7s %-7s %-6s %-8s %-15s %-15s %s\n",
-        "Proxy", "Status", "Country", "Code", "Proto", "Content Sim", "Title Sim", "Title")
-    fmt.Println(strings.Repeat("─", 100))
+    fmt.Printf("\n\n📌 Local Connection")
+    fmt.Printf("\n├─ Your Country:      %s", result.LocalCountry)
+    fmt.Printf("\n├─ Connection Status: %s (%d)", result.Baseline.Status, result.Baseline.StatusCode)
     
-    for _, proxy := range result.Proxies {
-        if proxy.StatusCode != 0 && (proxy.StatusCode != result.Baseline.StatusCode || 
-           proxy.ContentSim < 0.8 || proxy.TitleSim < 0.8) {
-            printProxyInfo(proxy)
+    if result.Baseline.Location != "" {
+        fmt.Printf("\n└─ Redirected To:     %s", result.Baseline.Location)
+    } else {
+        fmt.Printf("\n└─ Direct Access:     %s", result.URL)
+    }
+    
+    fmt.Printf("\n\n📊 Geo-Blocking Analysis")
+    fmt.Printf("\n├─ Confidence Level:  %d/3", result.BlockingLevel)
+    fmt.Printf("\n├─ Proxies Tested:    %d", len(result.Proxies))
+    fmt.Printf("\n├─ Anomalies Found:   %d", countAnomalies(result.Proxies))
+    fmt.Printf("\n└─ Target URL:        %s", result.URL)
+    
+    // Rest of the existing print logic...
+}
+
+func countAnomalies(proxies []ProxyInfo) int {
+    count := 0
+    for _, p := range proxies {
+        if p.StatusCode != 0 && (p.ContentSim < 0.8 || p.TitleSim < 0.8) {
+            count++
         }
     }
-    fmt.Println(strings.Repeat("─", 100))
+    return count
 }
 
 
@@ -739,31 +828,35 @@ func runCheck(ctx context.Context, config Config) Result {
         go func(workerID int) {
             defer wg.Done()
             for job := range jobs {
-            start := time.Now()
-            logVerbose(start, fmt.Sprintf("Worker %d", workerID))
+                workerCtx, cancel := context.WithTimeout(ctx, 7*time.Second)
+                defer cancel()
+                
+                start := time.Now()
+                logVerbose(start, fmt.Sprintf("Worker %d", workerID))
+                
+                info := checkProxyWithRetry(workerCtx, job.Proxy, config.TargetURL, config.NoPrecheck, job.Retries, tracker, config)
+                
+                atomic.AddUint64(&processedProxies, 1)
+                if info.Status == "UP" {
+                    atomic.AddUint64(&successCount, 1)
+                    activeProxies.Add(info)
+                } else {
+                    atomic.AddUint64(&failureCount, 1)
+                }
+                if info.Status == "INVALID" || info.Status == "MAX_RETRIES" {
+                    atomic.AddUint64(&errorCount, 1)
+                }
+                
+                if info.StatusCode != 0 {
                     select {
-                case <-ctx.Done():
-                    return
-                default:
-                    info := checkProxyWithRetry(ctx, job.Proxy, config.TargetURL, config.NoPrecheck, job.Retries, tracker, config)
-                        
-                                        atomic.AddUint64(&processedProxies, 1)
-                    if info.Status == "UP" {
-                        atomic.AddUint64(&successCount, 1)
-                        activeProxies.Add(info)
-                    } else {
-                        atomic.AddUint64(&failureCount, 1)
-                    }
-                    if info.Status == "INVALID" || info.Status == "MAX_RETRIES" {
-                        atomic.AddUint64(&errorCount, 1)
-                    }
-                    
-                    if info.StatusCode != 0 {
-                        results <- info
+                    case results <- info:
+                    case <-ctx.Done():
+                        return
                     }
                 }
             }
         }(w)
+
     }
 
         go func() {
@@ -789,14 +882,22 @@ func runCheck(ctx context.Context, config Config) Result {
         close(results)
     }()
 
-        for info := range results {
+    var success, total int
+    for info := range results {
         result.Proxies = append(result.Proxies, info)
         updateDashboardMetrics(info)
+        total++
+        
+        if info.StatusCode >= 200 && info.StatusCode < 400 {
+            success++
+        }
         
         if config.Verbose {
             printProxyInfo(info)
         }
     }
+    fmt.Printf("\nProxy success rate: %d/%d (%.1f%%)\n", 
+        success, total, float64(success)/float64(total)*100)
 
         result.BlockingLevel = determineBlockingLevel(result.Baseline, result.Proxies)
     result.DifferentCountries = analyzeResults(result.Baseline, result.Proxies)
@@ -805,11 +906,15 @@ func runCheck(ctx context.Context, config Config) Result {
 }
 
 func isValidProxy(proxy string) bool {
-    parts := strings.Split(proxy, ":")
-    if len(parts) != 2 {
+    host, portStr, err := net.SplitHostPort(proxy)
+    if err != nil {
         return false
     }
-    port, err := strconv.Atoi(parts[1])
+    // Validate host is not empty (could be DNS name or IP)
+    if host == "" {
+        return false
+    }
+    port, err := strconv.Atoi(portStr)
     return err == nil && port > 0 && port <= 65535
 }
 
@@ -821,7 +926,7 @@ func bulkCheckProxies(proxies []string, timeout time.Duration) []string {
         wg.Add(1)
         go func(p string) {
             defer wg.Done()
-            if quickProxyCheck(p) {
+            if quickProxyCheck(p, timeout) {
                 valid <- p
             }
         }(proxy)
@@ -852,27 +957,35 @@ func isValidProxyFormat(proxy string) bool {
 func checkProxyWithRetry(ctx context.Context, proxyAddr string, targetURL string,
     noPrecheck bool, retries int, tracker *UsedProxyTracker, config Config) ProxyInfo {
     
-    maxRetries := config.Retries
     baseDelay := 500 * time.Millisecond
-    maxDelay := 5 * time.Second
-    
-    for attempt := 0; attempt <= maxRetries; attempt++ {
-                if _, exists := badProxies.Load(proxyAddr); exists {
+    maxDelay := config.Timeout
+    if maxDelay > 5*time.Second {
+        maxDelay = 5*time.Second
+    }
+
+    for attempt := 0; attempt <= retries; attempt++ {
+        // Create per-attempt context with timeout
+        attemptCtx, cancel := context.WithTimeout(ctx, config.Timeout)
+        defer cancel()
+
+        if _, exists := badProxies.Load(proxyAddr); exists {
             return ProxyInfo{Status: "CACHED_FAIL"}
         }
         
-        result := checkProxy(proxyAddr, targetURL, config)
+        result := checkProxy(attemptCtx, proxyAddr, targetURL, config)
         
-                if result.Status == "UP" || result.Status == "INVALID" {
+        // Don't retry successful or invalid proxies
+        if result.Status == "UP" || result.Status == "INVALID" {
             return result
         }
 
-        if attempt < maxRetries {
-                        delay := baseDelay * time.Duration(1<<attempt)
+        if attempt < retries {
+            // Exponential backoff with jitter
+            delay := time.Duration(math.Pow(2, float64(attempt))) * baseDelay
             if delay > maxDelay {
                 delay = maxDelay
             }
-            delay += time.Duration(rand.Intn(500)) * time.Millisecond
+            delay += time.Duration(rand.Int63n(500)) * time.Millisecond
             
             select {
             case <-time.After(delay):
@@ -886,7 +999,7 @@ func checkProxyWithRetry(ctx context.Context, proxyAddr string, targetURL string
 }
 
 
-func cachedLookup(host string) (string, error) {
+func cachedLookup(ctx context.Context, host string) (string, error) {
     start := time.Now()
     defer logVerbose(start, "DNS Lookup")
         if ip := net.ParseIP(host); ip != nil {
@@ -923,7 +1036,7 @@ func cachedLookup(host string) (string, error) {
     return result, nil
 }
 
-func getCountryWithCache(ip string) (string, error) {
+func getCountryWithCache(ctx context.Context, ip string) (string, error) {
     geoCache.RLock()
     if country, ok := geoCache.m[ip]; ok {
         geoCache.RUnlock()
@@ -943,154 +1056,154 @@ func getCountryWithCache(ip string) (string, error) {
     return results.Country_short, nil
 }
 
-
-func checkProxy(proxyAddr string, targetURL string, config Config) ProxyInfo {
+func checkProxy(ctx context.Context, proxyAddr string, targetURL string, config Config) ProxyInfo {
     if _, exists := badProxies.Load(proxyAddr); exists {
         return ProxyInfo{Status: "CACHED_FAIL"}
     }
 
     info := ProxyInfo{Address: proxyAddr}
     start := time.Now()
-
     defer func() {
-        // Only mark as bad if not UP and not a redirect case
         if !strings.Contains(info.Status, "UP") {
             badProxies.Store(proxyAddr, true)
         }
         logProxyAttempt(proxyAddr, start, strings.Contains(info.Status, "UP"))
     }()
 
-    // Validate proxy format
-    cleanAddr := strings.TrimPrefix(strings.TrimPrefix(proxyAddr, "http://"), "https://")
-    host, port, err := net.SplitHostPort(cleanAddr)
+    target, err := url.Parse(targetURL)
     if err != nil {
-        info.Status = "INVALID"
+        info.Status = "INVALID_URL"
         return info
     }
 
-    // DNS resolution with caching
-    ip, err := cachedLookup(host)
-    if err != nil {
-        info.Status = "DNS_FAIL"
-        return info
+    deadline, ok := ctx.Deadline()
+    if !ok {
+        deadline = time.Now().Add(config.Timeout)
     }
+    remaining := time.Until(deadline)
 
-    // GeoIP lookup with caching
-    country, err := getCountryWithCache(ip)
-    if err != nil {
-        info.Country = "Unknown"
-    } else {
-        info.Country = country
-    }
+    client := &fasthttp.Client{
+        ReadTimeout:  remaining,
+        WriteTimeout: remaining,
+        Dial: func(addr string) (net.Conn, error) {
+            // Phase 1: TCP Connection with aggressive timeout
+            conn, err := fasthttp.DialTimeout(proxyAddr, 2*time.Second)
+            if err != nil {
+                return nil, fmt.Errorf("TCP dial failed: %w", err)
+            }
 
-    // Protocol detection
-    info.Protocol = determineProxyProtocol(net.JoinHostPort(ip, port))
-    if info.Protocol == "unknown" {
-        info.Status = "PROTO_FAIL"
-        return info
-    }
-
-    // Setup HTTP client with proxy
-    client := clientPool.Get().(*fasthttp.Client)
-    defer clientPool.Put(client)
-    client.Dial = fasthttpproxy.FasthttpHTTPDialerTimeout(cleanAddr, 3*time.Second)
-
-    maxRedirects := 3
-    redirectCount := 0
-    currentURL := targetURL
-    var firstLocation string
-    var finalStatusCode int
-
-    // Redirect handling loop
-    for {
-        req := fasthttp.AcquireRequest()
-        resp := fasthttp.AcquireResponse()
-        req.SetRequestURI(currentURL)
-
-        err := client.Do(req, resp)
-        finalStatusCode = resp.StatusCode()
-
-        if err != nil {
-            info.Status = "DOWN"
-            info.StatusCode = 0
-            fasthttp.ReleaseRequest(req)
-            fasthttp.ReleaseResponse(resp)
-            break
-        }
-
-        // Handle redirects
-        if redirectCount < maxRedirects && finalStatusCode >= 300 && finalStatusCode < 400 {
-            location := resp.Header.Peek("Location")
-            if len(location) > 0 {
-                if firstLocation == "" {
-                    firstLocation = string(location)
+            if target.Scheme == "https" {
+                // Get proper host:port for CONNECT
+                host := target.Hostname()
+                port := target.Port()
+                if port == "" {
+                    port = "443"
                 }
-                currentURL = string(location)
-                redirectCount++
-                fasthttp.ReleaseRequest(req)
-                fasthttp.ReleaseResponse(resp)
-                continue
-            }
-        }
+                connectTarget := net.JoinHostPort(host, port)
 
-        // Process final response
-        info.StatusCode = finalStatusCode
-        info.Location = firstLocation  // Store first redirect location
-        
-        if finalStatusCode >= 200 && finalStatusCode < 400 {
-            if redirectCount > 0 {
-                info.Status = fmt.Sprintf("UP (%d redirects)", redirectCount)
-            } else {
-                info.Status = "UP"
+                // Phase 2: CONNECT Request
+                connectDeadline := time.Now().Add(3 * time.Second)
+                conn.SetWriteDeadline(connectDeadline)
+                
+                connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", 
+                    connectTarget, connectTarget)
+                
+                if _, err := conn.Write([]byte(connectReq)); err != nil {
+                    conn.Close()
+                    return nil, fmt.Errorf("CONNECT write failed: %w", err)
+                }
+
+                // Phase 3: CONNECT Response
+                conn.SetReadDeadline(connectDeadline.Add(1 * time.Second))
+                br := bufio.NewReader(conn)
+                resp, err := http.ReadResponse(br, nil)
+                if err != nil {
+                    conn.Close()
+                    return nil, fmt.Errorf("CONNECT read failed: %w", err)
+                }
+                if resp.StatusCode != 200 {
+                    conn.Close()
+                    return nil, fmt.Errorf("bad CONNECT status: %d", resp.StatusCode)
+                }
+
+                // Phase 4: TLS Handshake
+                tlsConfig := &tls.Config{
+                    ServerName: host, // Use original target hostname
+                    MinVersion: tls.VersionTLS12,
+                }
+                tlsConn := tls.Client(conn, tlsConfig)
+                handshakeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+                defer cancel()
+                
+                if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
+                    tlsConn.Close()
+                    return nil, fmt.Errorf("TLS handshake failed: %w", err)
+                }
+
+                // Phase 5: Set final deadline for HTTPS connection
+                tlsConn.SetDeadline(time.Now().Add(remaining - 5*time.Second))
+                return tlsConn, nil
             }
             
-            // Content analysis
-            body := resp.Body()
-            proxyContent := string(body)
-            
-            // Only compare content if baseline exists
-            if baselineContent != "" {
-                proxyTagCounts := extractTagCounts(proxyContent)
-                info.ContentSim = calculateTagSimilarity(baselineTagCounts, proxyTagCounts)
-                info.Title = extractTitle(body)
-                info.TitleSim = calculateSimilarity(info.Title, baselineTitle)
-            }
-        } else {
-            info.Status = "DOWN"
-        }
+            // For HTTP, set final deadline
+            conn.SetDeadline(time.Now().Add(remaining))
+            return conn, nil
+        },
+    }
 
+    req := fasthttp.AcquireRequest()
+    resp := fasthttp.AcquireResponse()
+    defer func() {
         fasthttp.ReleaseRequest(req)
         fasthttp.ReleaseResponse(resp)
-        break
+    }()
+
+    req.SetRequestURI(targetURL)
+    req.Header.SetMethod(fasthttp.MethodGet)
+    req.Header.Set("Host", target.Host)
+    req.Header.SetUserAgent("Mozilla/5.0 (compatible; zgeo-proxy-checker/1.0)")
+
+    // Get proxy metadata
+    if host, _, err := net.SplitHostPort(proxyAddr); err == nil {
+        if geo, err := getCountryWithCache(ctx, host); err == nil {
+            info.Country = geo
+        }
     }
 
-    // Detailed verbose logging
-    if config.Verbose {
-        logDetails := []string{
-            fmt.Sprintf("Proxy: %s", proxyAddr),
-            fmt.Sprintf("Status: %s", info.Status),
-            fmt.Sprintf("Final Code: %d", info.StatusCode),
-        }
+    err = client.DoTimeout(req, resp, remaining)
+    if err != nil {
+        info.Status = "DOWN"
+        info.StatusCode = 0
+        return info
+    }
+
+    info.StatusCode = resp.StatusCode()
+    info.Protocol = target.Scheme
+    if location := resp.Header.Peek("Location"); len(location) > 0 {
+        info.Location = string(location)
+    }
+
+    if info.StatusCode >= 200 && info.StatusCode < 400 {
+        info.Status = "UP"
         
-        if redirectCount > 0 {
-            logDetails = append(logDetails,
-                fmt.Sprintf("Redirects: %d", redirectCount),
-                fmt.Sprintf("First Location: %s", firstLocation),
-            )
+        if baselineContent != "" {
+            body := resp.Body()
+            if strings.Contains(string(resp.Header.ContentType()), "text/html") {
+                info.Title = extractTitle(body)
+                
+                proxyContent := string(body)
+                proxyTagCounts := extractTagCounts(proxyContent)
+                info.ContentSim = calculateTagSimilarity(baselineTagCounts, proxyTagCounts)
+                info.TitleSim = calculateSimilarity(info.Title, baselineTitle)
+            }
         }
-        
-        if info.Status == "UP" {
-            logDetails = append(logDetails,
-                fmt.Sprintf("Content Sim: %.2f", info.ContentSim),
-                fmt.Sprintf("Title Sim: %.2f", info.TitleSim),
-            )
-        }
-        
-        verboseLogger.Println(strings.Join(logDetails, " | "))
+    } else {
+        info.Status = fmt.Sprintf("DOWN (%d)", info.StatusCode)
     }
 
     return info
 }
+
 
 func normalizeContent(s string) string {
         return strings.ToLower(strings.Join(strings.Fields(s), " "))
@@ -1273,16 +1386,6 @@ func updateDashboardMetrics(info ProxyInfo) {
     }
 }
 
-func setupSignalHandler(cancel context.CancelFunc) {
-    c := make(chan os.Signal, 1)
-    signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-    go func() {
-        <-c
-        fmt.Println("\nReceived interrupt signal. Shutting down gracefully...")
-        cancel()
-    }()
-}
-
 func cleanup() {
     if ip2locationDB != nil {
         ip2locationDB.Close()
@@ -1332,14 +1435,17 @@ func loadProxies(proxyFile, jsonFile string) []string {
 }
 
 
-func loadProxiesGroupedByCountry(proxyFile, jsonFile string) ProxyMap {
+func loadProxiesGroupedByCountry(proxyFile, jsonFile string, timeout time.Duration) ProxyMap {
     proxyMap := make(ProxyMap)
     
         proxies := loadProxies(proxyFile, jsonFile)
     if len(proxies) == 0 {
         return proxyMap
     }
-
+    if ip2locationDB == nil {
+        fmt.Println("GeoIP database not initialized")
+        return proxyMap
+    }
         var dnsWg sync.WaitGroup
     dnsSem := make(chan struct{}, 200)
     
@@ -1351,12 +1457,12 @@ func loadProxiesGroupedByCountry(proxyFile, jsonFile string) ProxyMap {
             defer func() { <-dnsSem }()
             
             host, _, _ := net.SplitHostPort(p)
-            cachedLookup(host)
+            cachedLookup(context.Background(), host)
         }(proxy)
     }
     dnsWg.Wait()
 
-        verifiedProxies := bulkPreCheck(proxies, 300)
+        verifiedProxies := bulkPreCheck(proxies, timeout)
     fmt.Printf("Pre-check complete: %d/%d proxies alive\n", len(verifiedProxies), len(proxies))
 
         var geoWg sync.WaitGroup
@@ -1372,9 +1478,9 @@ func loadProxiesGroupedByCountry(proxyFile, jsonFile string) ProxyMap {
             defer geoWg.Done()
             for proxy := range geoQueue {
                 host, _, _ := net.SplitHostPort(proxy)
-                ip, _ := cachedLookup(host)
+                ip, _ := cachedLookup(context.Background(), host) // Add context
                 
-                country, err := getCountry(ip)
+                country, err := getCountryWithCache(context.Background(), ip) // Use context-aware version
                 if err != nil {
                     country = "Unknown"
                 }
@@ -1608,6 +1714,7 @@ func runMassiveCheck(ctx context.Context, config Config) []Result {
 }
 
 var (
+    timeout        = flag.Duration("timeout", 5*time.Second, "Timeout for proxy connections")
     dbFile              = flag.String("db", "IP2LOCATION-LITE-DB1.BIN", "Path to IP2Location DB")
     proxiesFile         = flag.String("w", "", "Proxy list file")
     jsonWordlist        = flag.String("jw", "", "JSON proxy list")
@@ -1623,89 +1730,103 @@ var (
     outputFormat        = flag.String("o", "json", "Output format")
 )
 
+var (
+    httpClient      *http.Client
+    clientPool      *sync.Pool
+)
+
 func main() {
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
-
     setupSignalHandler(cancel)
-    defer cleanup()
-
+    
+    // Parse command line flags
     flag.Parse()
+    
+    // Initialize configuration
+    config := Config{
+        Timeout:            *timeout,
+        ProxiesFile:        *proxiesFile,
+        JSONWordlist:       *jsonWordlist,
+        TargetURL:          *targetURL,
+        Threads:            *threads,
+        Verbose:            *vFlag,
+        NoPrecheck:         *noPrecheck,
+        OutputFormat:       *outputFormat,
+        Retries:            *retries,
+        OneAttemptPerCountry: *oneAttemptPerCountry,
+    }
 
-        var err error
+    // Initialize GeoIP database
+    var err error
     ip2locationDB, err = ip2location.OpenDB(*dbFile)
     if err != nil {
-        fmt.Printf("Error opening GeoIP database: %v\n", err)
-        return
+        log.Fatalf("Failed to initialize GeoIP database: %v", err)
     }
     defer ip2locationDB.Close()
 
-        proxyMap := loadProxiesGroupedByCountry(*proxiesFile, *jsonWordlist)
+    // Load and verify proxies
+    proxyMap := loadProxiesGroupedByCountry(config.ProxiesFile, config.JSONWordlist, config.Timeout)
     if len(proxyMap) == 0 {
-        fmt.Println("No valid proxies found")
-        return
+        log.Fatal("No valid proxies found")
     }
+    config.ProxyList = proxyMap
 
-        if (*targetURL == "" && *targetWordlist == "") {
-        fmt.Println("Error: Target URL or wordlist required")
-        flag.PrintDefaults()
-        return
-    }
-
-    config := Config{
-        ProxyList:            proxyMap,
-        ProxiesFile:          *proxiesFile,
-        JSONWordlist:         *jsonWordlist,
-        TargetWordlist:       *targetWordlist,
-        Threads:              *threads,
-        TargetURL:            *targetURL,
-        Verbose:              *vFlag,
-        NoPrecheck:           *noPrecheck,
-        UpOnly:               *upOnly,
-        FreshProxyOut:        *freshProxyOut,
-        OneAttemptPerCountry: *oneAttemptPerCountry,
-        Retries:              *retries,
-        OutputFormat:         *outputFormat,
-    }
-    if *vFlag {
-        logFile, err := os.OpenFile("zgeo_debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-        if err == nil {
-            verboseLogger = log.New(logFile, "", log.LstdFlags|log.Lmicroseconds)
-        }
-    }
+    // Establish baseline connection
     baselineInfo, baseContent, baseTitle := getBaseline(config.TargetURL)
-    if baseContent == "" {
-        fmt.Println("Warning: Could not establish baseline - using empty comparison")
-    }
-    baselineContent = baseContent
-    baselineTitle = baseTitle
     dashboard.Baseline = baselineInfo
-
-        dashboard.StartTime = time.Now()
+    dashboard.StartTime = time.Now()
     dashboard.DifferentCountries = make(map[string]int)
 
+    if baselineInfo.StatusCode == 0 {
+        log.Println("⚠️  Baseline connection failed - comparison metrics disabled")
+    } else {
+        baselineContent = baseContent
+        baselineTitle = baseTitle
+        baselineTagCounts = extractTagCounts(baselineContent)
+    }
+
+    // Run checks
     var allResults AllResults
     allResults.StartTime = dashboard.StartTime
 
-        if config.TargetWordlist != "" {
-        allResults.Results = runMassiveCheck(ctx, config)
-    } else {
-        result := runCheck(ctx, config)
-        allResults.Results = []Result{result}
+    result := runCheck(ctx, config)
+    result.LocalCountry = baselineInfo.Country // Set LocalCountry from baseline
+    allResults.Results = []Result{result}
+    
+    // Generate output
+    allResults.EndTime = time.Now()
+    switch config.OutputFormat {
+    case "html":
+        saveHTMLReport(allResults)
+    case "json":
+        saveImprovedJSON(improveJSONOutput(allResults.Results))
+    default:
         printResults(result, config.UpOnly)
     }
+
+    // Final output
+    fmt.Println(generateSummaryReport(allResults.Results))
     
-        allResults.EndTime = time.Now()
-    if config.OutputFormat == "html" {
-        saveHTMLReport(allResults)
-    } else {
-        saveImprovedJSON(improveJSONOutput(allResults.Results))
-    }
-    
-        if config.FreshProxyOut {
+    if config.FreshProxyOut {
         saveFreshProxies(activeProxies.GetAll())
     }
-    fmt.Println(generateSummaryReport(allResults.Results))
+}
+
+
+// Signal handler setup
+func setupSignalHandler(cancel context.CancelFunc) {
+    c := make(chan os.Signal, 1)
+    signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+    go func() {
+        <-c
+        fmt.Println("\n🛑 Received termination signal - shutting down...")
+        cancel()
+    }()
+}
+
+func shouldRetry(status string) bool {
+    return status == "DOWN" || status == "TIMEOUT"
 }
 
 func logVerbose(start time.Time, operation string) {
@@ -1727,6 +1848,21 @@ func logProxyAttempt(proxy string, start time.Time, success bool) {
             time.Since(start),
         )
     }
+}
+
+func checkFreshProxyAge() {
+    files, _ := filepath.Glob("fresh_proxies_*.json")
+    now := time.Now()
+    
+    for _, f := range files {
+        tsStr := strings.TrimSuffix(strings.TrimPrefix(f, "fresh_proxies_"), ".json")
+        fileTime, err := time.Parse("20060102_1504", tsStr)
+        if err == nil && now.Sub(fileTime) < time.Hour {
+            return
+        }
+    }
+    
+    fmt.Println("\nTip: No fresh proxies found from last hour. Run with -fpo next time to cache working proxies.")
 }
 
 func improveJSONOutput(results []Result) map[string]interface{} {
@@ -1812,7 +1948,7 @@ func generateSummaryReport(results []Result) string {
     return summary.String()
 }
 
-func bulkPreCheck(proxies []string, concurrency int) []string {
+func bulkPreCheck(proxies []string, timeout time.Duration) []string {
     sem := make(chan struct{}, 50)
     validProxies := make(chan string, len(proxies))
     var wg sync.WaitGroup
@@ -1824,7 +1960,7 @@ func bulkPreCheck(proxies []string, concurrency int) []string {
             sem <- struct{}{}
             defer func() { <-sem }()
             
-            if quickProxyCheck(p) {
+            if quickProxyCheck(p, timeout) {
                 validProxies <- p
             }
         }(proxy)
@@ -1876,6 +2012,79 @@ func startProgressUpdater(total int, ctx context.Context) {
         }
     }()
 }
+
+func getLocalCountry() string {
+    services := []string{
+        "https://api.ipify.org?format=text",
+        "https://ident.me",
+        "https://ifconfig.me/ip",
+    }
+
+    var ip string
+    var lastErr error
+    
+    for _, service := range services {
+        resp, err := http.Get(service)
+        if err == nil {
+            defer resp.Body.Close()
+            body, _ := io.ReadAll(resp.Body)
+            ip = strings.TrimSpace(string(body))
+            if net.ParseIP(ip) != nil {
+                break
+            }
+        }
+        lastErr = err
+    }
+
+    if ip == "" {
+        fmt.Printf("\n⚠️ IP detection failed (Last error: %v)\n", lastErr)
+        return "Unknown Location"
+    }
+
+    country, err := getCountry(ip)
+    if err != nil {
+        fmt.Printf("\n⚠️ GeoIP lookup failed for %s: %v\n", ip, err)
+        return "Location Unknown"
+    }
+    
+    if record, err := ip2locationDB.Get_all(ip); err == nil {
+        return fmt.Sprintf("%s (%s)", record.Country_long, record.Country_short)
+    }
+    
+    return country
+}
+
+func downloadProxies() bool {
+    fmt.Print("\nNo proxy list found. Download default proxies? (y/n): ")
+    var response string
+    fmt.Scanln(&response)
+    
+    if strings.ToLower(response) == "y" {
+        resp, err := http.Get("https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt")
+        if err != nil {
+            fmt.Println("Download failed:", err)
+            return false
+        }
+        defer resp.Body.Close()
+        
+        file, err := os.Create("http.txt")
+        if err != nil {
+            fmt.Println("Error creating file:", err)
+            return false
+        }
+        defer file.Close()
+        
+        _, err = io.Copy(file, resp.Body)
+        if err != nil {
+            fmt.Println("Download failed:", err)
+            return false
+        }
+        fmt.Println("Downloaded proxies to http.txt")
+        return true
+    }
+    return false
+}
+
 
 func sortMapByValue(m map[string]int) []string {
     type kv struct {
