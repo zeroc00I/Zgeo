@@ -564,13 +564,26 @@ type ProxyInfo struct {
     Location   string
     Protocol   string
     Error      string
+    Duration   time.Duration
 }
 
 var proxyMapMu sync.Mutex
 
 var (
     badProxies   sync.Map
+    clientPool = sync.Pool{
+        New: func() interface{} {
+            return &fasthttp.Client{
+                NoDefaultUserAgentHeader: true,
+                MaxConnsPerHost:          100,
+                ReadBufferSize:           4096,
+                WriteBufferSize:          4096,
+                MaxIdleConnDuration:      30 * time.Second,
+            }
+        },
+    }
 )
+
 
 
 var htmlTemplate = `
@@ -1455,101 +1468,27 @@ func prioritizeProxies(proxies []string) []string {
 }
 
 func checkProxy(ctx context.Context, proxyAddr string, targetURL string, config Config) (ProxyInfo, error) {
-    if _, exists := badProxies.Load(proxyAddr); exists {
-        return ProxyInfo{Status: "CACHED_FAIL"}, fmt.Errorf("proxy marked as bad: %s", proxyAddr)
-    }
-
     info := ProxyInfo{Address: proxyAddr}
-    if config.Verbose {
-        fmt.Printf("[CHECK] Iniciando verificação de %s\n", proxyAddr)
-    }
-    start := time.Now()
-    success := false // Track success for logging
+    startTime := time.Now()
     defer func() {
-        logProxyAttempt(proxyAddr, start, success, config)
+        info.Duration = time.Since(startTime)
+        logVerbose(startTime, fmt.Sprintf("Proxy check %s", info.Status))
     }()
 
     // Validate target URL
     target, err := url.Parse(targetURL)
     if err != nil {
-        info.Status = "INVALID_URL"
+        info.Status = "INVALID_TARGET"
         return info, fmt.Errorf("invalid target URL: %w", err)
     }
 
-    deadline, ok := ctx.Deadline()
-    if !ok {
-        deadline = time.Now().Add(config.Timeout)
-    }
-    remaining := time.Until(deadline)
+    // Get client from pool
+    client := clientPool.Get().(*fasthttp.Client)
+    defer clientPool.Put(client)
 
-    client := &fasthttp.Client{
-        ReadTimeout:  remaining,
-        WriteTimeout: remaining,
-        Dial: func(addr string) (net.Conn, error) {
-            // Phase 1: TCP Connection
-            conn, err := fasthttp.DialTimeout(proxyAddr, 2*time.Second)
-            if err != nil {
-                return nil, fmt.Errorf("tcp connection failed: %w", err)
-            }
-
-            if target.Scheme == "https" {
-                // HTTPS proxy handling
-                host := target.Hostname()
-                port := target.Port()
-                if port == "" {
-                    port = "443"
-                }
-                connectTarget := net.JoinHostPort(host, port)
-
-                // Phase 2: CONNECT Request
-                conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
-                _, err = conn.Write([]byte(fmt.Sprintf(
-                    "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n",
-                    connectTarget, connectTarget,
-                )))
-                if err != nil {
-                    conn.Close()
-                    return nil, fmt.Errorf("connect write failed: %w", err)
-                }
-
-                // Phase 3: Verify CONNECT Response
-                conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-                br := bufio.NewReader(conn)
-                resp, err := http.ReadResponse(br, nil)
-                if err != nil {
-                    conn.Close()
-                    return nil, fmt.Errorf("connect read failed: %w", err)
-                }
-                if resp.StatusCode != 200 {
-                    conn.Close()
-                    return nil, fmt.Errorf("bad connect status: %d", resp.StatusCode)
-                }
-
-                // Phase 4: TLS Handshake
-                tlsConfig := &tls.Config{
-                    ServerName: host,
-                    MinVersion: tls.VersionTLS12,
-                }
-                tlsConn := tls.Client(conn, tlsConfig)
-                handshakeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-                defer cancel()
-                
-                if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
-                    tlsConn.Close()
-                    return nil, fmt.Errorf("tls handshake failed: %w", err)
-                }
-
-                // Phase 5: Set final timeout
-                tlsConn.SetDeadline(time.Now().Add(remaining - 5*time.Second))
-                return tlsConn, nil
-            }
-
-            // Plain HTTP
-            conn.SetDeadline(time.Now().Add(remaining))
-            return conn, nil
-        },
-    }
-
+    // Configure client for this proxy
+    client.Dial = createProxyDialer(proxyAddr, target, config.Timeout)
+    
     req := fasthttp.AcquireRequest()
     resp := fasthttp.AcquireResponse()
     defer func() {
@@ -1557,52 +1496,132 @@ func checkProxy(ctx context.Context, proxyAddr string, targetURL string, config 
         fasthttp.ReleaseResponse(resp)
     }()
 
+    // Configure request
     req.SetRequestURI(targetURL)
     req.Header.SetMethod(fasthttp.MethodGet)
     req.Header.Set("Host", target.Host)
-    req.Header.SetUserAgent("Mozilla/5.0 (compatible; zgeo-proxy-checker/1.0)")
+    req.Header.SetUserAgent("Mozilla/5.0 (compatible; zgeo-proxy-checker/2.0)")
+    req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
-    // Get country info
-    if host, _, err := net.SplitHostPort(proxyAddr); err == nil {
-        if country, err := getCountryWithCache(ctx, host); err == nil {
-            info.Country = country
-        }
-    }
-
-    // Execute request
-    err = client.DoTimeout(req, resp, remaining)
+    // Execute request with context-based timeout
+    err = client.DoTimeout(req, resp, config.Timeout)
     if err != nil {
-        info.Status = "DOWN"
-        info.StatusCode = 0
-        return info, fmt.Errorf("request failed: %w", err)
+        info.Status = classifyError(err)
+        info.Error = err.Error()
+        
+        if isRetryableError(err) {
+            badProxies.Store(proxyAddr, struct{}{})
+        }
+        return info, err
     }
 
+    // Process successful response
     info.StatusCode = resp.StatusCode()
     info.Protocol = target.Scheme
     info.Location = string(resp.Header.Peek("Location"))
+    
+    // Mark as UP if we got any valid HTTP response
+    info.Status = "UP"
+    
+    // Get country information
+    if host, _, err := net.SplitHostPort(proxyAddr); err == nil {
+        info.Country, _ = getCountryWithCache(ctx, host)
+    }
 
-    // Check if successful
-    if info.StatusCode >= 200 && info.StatusCode < 400 {
-        info.Status = "UP"
-        success = true
-        
-        if baselineContent != "" {
-            body := resp.Body()
-            if strings.Contains(string(resp.Header.ContentType()), "text/html") {
-                info.Title = extractTitle(body)
-                proxyContent := string(body)
-                proxyTagCounts := extractTagCounts(proxyContent)
-                info.ContentSim = calculateTagSimilarity(baselineTagCounts, proxyTagCounts)
-                info.TitleSim = calculateSimilarity(info.Title, baselineTitle)
-            }
+    // Calculate metrics if we have baseline
+    if baselineContent != "" {
+        body := resp.Body()
+        if strings.Contains(string(resp.Header.ContentType()), "text/html") {
+            info.Title = extractTitle(body)
+            proxyContent := string(body)
+            proxyTagCounts := extractTagCounts(proxyContent)
+            info.ContentSim = calculateTagSimilarity(baselineTagCounts, proxyTagCounts)
+            info.TitleSim = calculateSimilarity(info.Title, baselineTitle)
         }
-    } else {
-        info.Status = fmt.Sprintf("DOWN (%d)", info.StatusCode)
     }
 
     return info, nil
 }
 
+func createProxyDialer(proxyAddr string, target *url.URL, timeout time.Duration) func(string) (net.Conn, error) {
+    return func(addr string) (net.Conn, error) {
+        // Establish proxy connection
+        conn, err := fasthttp.DialTimeout(proxyAddr, 3*time.Second)
+        if err != nil {
+            return nil, fmt.Errorf("proxy connection failed: %w", err)
+        }
+
+        // HTTPS-specific handling
+        if target.Scheme == "https" {
+            host, port, _ := net.SplitHostPort(target.Host)
+            if port == "" {
+                port = "443"
+            }
+
+            // Send CONNECT request
+            connectReq := fmt.Sprintf(
+                "CONNECT %s:%s HTTP/1.1\r\nHost: %s:%s\r\nProxy-Connection: Keep-Alive\r\n\r\n",
+                host, port, host, port,
+            )
+            
+            conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+            if _, err := conn.Write([]byte(connectReq)); err != nil {
+                conn.Close()
+                return nil, fmt.Errorf("CONNECT write failed: %w", err)
+            }
+
+            // Verify CONNECT response
+            br := bufio.NewReader(conn)
+            resp, err := http.ReadResponse(br, nil)
+            if err != nil || resp.StatusCode != 200 {
+                conn.Close()
+                status := 0
+                if resp != nil {
+                    status = resp.StatusCode
+                }
+                return nil, fmt.Errorf("CONNECT failed (status %d): %w", status, err)
+            }
+
+            // Perform TLS handshake
+            tlsConfig := &tls.Config{
+                ServerName:         host,
+                InsecureSkipVerify: true,
+                MinVersion:         tls.VersionTLS12,
+            }
+            
+            tlsConn := tls.Client(conn, tlsConfig)
+            tlsConn.SetDeadline(time.Now().Add(timeout - 2*time.Second))
+            if err := tlsConn.Handshake(); err != nil {
+                tlsConn.Close()
+                return nil, fmt.Errorf("TLS handshake failed: %w", err)
+            }
+
+            return tlsConn, nil
+        }
+
+        return conn, nil
+    }
+}
+
+// Add detailed error classification
+func classifyError(err error) string {
+    if err == nil {
+        return "success"
+    }
+    
+    switch {
+    case strings.Contains(err.Error(), "timeout"):
+        return "timeout"
+    case strings.Contains(err.Error(), "connection refused"):
+        return "refused"
+    case strings.Contains(err.Error(), "tls handshake"):
+        return "tls_error"
+    case strings.Contains(err.Error(), "reset by peer"):
+        return "connection_reset"
+    default:
+        return "unknown_error"
+    }
+}
 
 
 func normalizeContent(s string) string {
@@ -2264,7 +2283,6 @@ var (
 
 var (
     httpClient      *http.Client
-    clientPool      *sync.Pool
 )
 
 func main() {
